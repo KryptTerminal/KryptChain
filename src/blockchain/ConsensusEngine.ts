@@ -1,120 +1,145 @@
 ```typescript
-import { Hash, Block, Transaction, PublicKey, Signature } from './types';
+import { Block, Transaction, ValidationResult } from './types';
 import { SHA256 } from 'crypto-js';
-import { validateBlock, verifySignature } from './crypto-utils';
-import { ConsensusError } from './errors';
+import { EventEmitter } from 'events';
+import { ECPair, crypto } from 'bitcoinjs-lib';
+import { Logger } from './logger';
 
-export class ConsensusEngine {
-  private readonly validators: Set<PublicKey>;
-  private readonly requiredValidations: number;
-  private pendingBlocks: Map<Hash, Block>;
-  private validations: Map<Hash, Set<PublicKey>>;
-  
-  constructor(validators: PublicKey[], requiredValidations: number) {
-    if (requiredValidations > validators.length) {
-      throw new ConsensusError('Required validations cannot exceed validator count');
-    }
-    
+export class ConsensusEngine extends EventEmitter {
+  private readonly validators: Set<string>;
+  private readonly pendingBlocks: Map<string, Block>;
+  private currentBlock: Block | null;
+  private chainHead: string;
+  private readonly logger: Logger;
+
+  constructor(validators: string[], chainHead: string) {
+    super();
     this.validators = new Set(validators);
-    this.requiredValidations = requiredValidations;
     this.pendingBlocks = new Map();
-    this.validations = new Map();
+    this.currentBlock = null;
+    this.chainHead = chainHead;
+    this.logger = new Logger('ConsensusEngine');
   }
 
-  public async proposeBlock(block: Block): Promise<boolean> {
+  public async proposeBlock(block: Block): Promise<ValidationResult> {
     try {
-      const blockHash = this.calculateBlockHash(block);
-      
-      if (this.pendingBlocks.has(blockHash)) {
-        throw new ConsensusError('Block already proposed');
+      if (!this.validators.has(block.proposer)) {
+        throw new Error('Invalid block proposer');
       }
 
-      if (!await validateBlock(block)) {
-        throw new ConsensusError('Invalid block proposed');
+      const isValid = await this.validateBlock(block);
+      if (!isValid) {
+        throw new Error('Invalid block');
       }
 
-      this.pendingBlocks.set(blockHash, block);
-      this.validations.set(blockHash, new Set());
+      this.pendingBlocks.set(block.hash, block);
+      this.emit('blockProposed', block);
 
-      return true;
+      return {
+        valid: true,
+        hash: block.hash
+      };
     } catch (error) {
-      console.error('Block proposal failed:', error);
-      return false;
+      this.logger.error('Block proposal failed', error);
+      return {
+        valid: false,
+        error: error.message
+      };
     }
   }
 
-  public async validateBlock(
-    blockHash: Hash, 
-    validatorKey: PublicKey,
-    signature: Signature
-  ): Promise<boolean> {
+  public async validateBlock(block: Block): Promise<boolean> {
     try {
-      if (!this.validators.has(validatorKey)) {
-        throw new ConsensusError('Unknown validator');
+      // Verify block hash
+      const calculatedHash = this.calculateBlockHash(block);
+      if (calculatedHash !== block.hash) {
+        return false;
       }
 
-      const block = this.pendingBlocks.get(blockHash);
-      if (!block) {
-        throw new ConsensusError('Unknown block');
+      // Verify previous block reference
+      if (block.previousHash !== this.chainHead) {
+        return false;
       }
 
-      if (!await verifySignature(blockHash, signature, validatorKey)) {
-        throw new ConsensusError('Invalid signature');
-      }
-
-      const blockValidations = this.validations.get(blockHash);
-      if (!blockValidations) {
-        throw new ConsensusError('Block validation set not found');
-      }
-
-      blockValidations.add(validatorKey);
-
-      return blockValidations.size >= this.requiredValidations;
-    } catch (error) {
-      console.error('Block validation failed:', error);
-      return false;
-    }
-  }
-
-  public async getFinalizedBlocks(): Promise<Block[]> {
-    const finalizedBlocks: Block[] = [];
-
-    for (const [hash, validations] of this.validations.entries()) {
-      if (validations.size >= this.requiredValidations) {
-        const block = this.pendingBlocks.get(hash);
-        if (block) {
-          finalizedBlocks.push(block);
-          this.pendingBlocks.delete(hash);
-          this.validations.delete(hash);
+      // Verify transactions
+      for (const tx of block.transactions) {
+        if (!await this.validateTransaction(tx)) {
+          return false;
         }
       }
+
+      // Verify block signature
+      return this.verifyBlockSignature(block);
+
+    } catch (error) {
+      this.logger.error('Block validation failed', error);
+      return false;
+    }
+  }
+
+  private async validateTransaction(tx: Transaction): Promise<boolean> {
+    try {
+      // Verify transaction signature
+      const signatureValid = crypto.verify(
+        Buffer.from(tx.hash),
+        Buffer.from(tx.signature, 'hex'),
+        Buffer.from(tx.publicKey, 'hex')
+      );
+
+      if (!signatureValid) {
+        return false;
+      }
+
+      // Additional transaction validation logic here
+      return true;
+
+    } catch (error) {
+      this.logger.error('Transaction validation failed', error);
+      return false;
+    }
+  }
+
+  private calculateBlockHash(block: Block): string {
+    const blockData = {
+      previousHash: block.previousHash,
+      timestamp: block.timestamp,
+      transactions: block.transactions,
+      nonce: block.nonce
+    };
+    return SHA256(JSON.stringify(blockData)).toString();
+  }
+
+  private verifyBlockSignature(block: Block): boolean {
+    try {
+      const keyPair = ECPair.fromPublicKey(Buffer.from(block.proposer, 'hex'));
+      return keyPair.verify(
+        Buffer.from(block.hash),
+        Buffer.from(block.signature, 'hex')
+      );
+    } catch (error) {
+      this.logger.error('Block signature verification failed', error);
+      return false;
+    }
+  }
+
+  public async finalizeBlock(hash: string): Promise<void> {
+    const block = this.pendingBlocks.get(hash);
+    if (!block) {
+      throw new Error('Block not found');
     }
 
-    return finalizedBlocks;
+    this.currentBlock = block;
+    this.chainHead = block.hash;
+    this.pendingBlocks.delete(hash);
+    this.emit('blockFinalized', block);
   }
 
-  private calculateBlockHash(block: Block): Hash {
-    const blockString = JSON.stringify({
-      prevHash: block.prevHash,
-      timestamp: block.timestamp,
-      transactions: block.transactions.map(t => t.id),
-      height: block.height
-    });
-    
-    return SHA256(blockString).toString();
+  public getCurrentBlock(): Block | null {
+    return this.currentBlock;
   }
 
-  public getValidatorCount(): number {
-    return this.validators.size;
-  }
-
-  public getPendingBlockCount(): number {
-    return this.pendingBlocks.size;
-  }
-
-  public clearPendingBlocks(): void {
-    this.pendingBlocks.clear();
-    this.validations.clear();
+  public getChainHead(): string {
+    return this.chainHead;
   }
 }
 ```
