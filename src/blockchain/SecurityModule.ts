@@ -1,122 +1,145 @@
 ```typescript
-import { ethers } from 'ethers';
-import { keccak256 } from 'ethers/lib/utils';
-import { AES, enc } from 'crypto-js';
+import { Block, Transaction, ValidationResult } from './types';
+import { SHA256 } from 'crypto-js';
+import { EventEmitter } from 'events';
+import { ECPair, crypto } from 'bitcoinjs-lib';
+import { Logger } from './logger';
 
-export interface SecurityConfig {
-  provider: string;
-  encryptionKey: string;
-  maxRetries: number;
-  timeoutMs: number;
-}
+export class ConsensusEngine extends EventEmitter {
+  private readonly validators: Set<string>;
+  private readonly pendingBlocks: Map<string, Block>;
+  private currentBlock: Block | null;
+  private chainHead: string;
+  private readonly logger: Logger;
 
-export class SecurityModule {
-  private provider: ethers.providers.Provider;
-  private encryptionKey: string;
-  private maxRetries: number;
-  private timeoutMs: number;
-  private nonces: Map<string, number>;
-
-  constructor(config: SecurityConfig) {
-    this.provider = new ethers.providers.JsonRpcProvider(config.provider);
-    this.encryptionKey = config.encryptionKey;
-    this.maxRetries = config.maxRetries;
-    this.timeoutMs = config.timeoutMs;
-    this.nonces = new Map<string, number>();
+  constructor(validators: string[], chainHead: string) {
+    super();
+    this.validators = new Set(validators);
+    this.pendingBlocks = new Map();
+    this.currentBlock = null;
+    this.chainHead = chainHead;
+    this.logger = new Logger('ConsensusEngine');
   }
 
-  public async signMessage(message: string, privateKey: string): Promise<string> {
+  public async proposeBlock(block: Block): Promise<ValidationResult> {
     try {
-      const wallet = new ethers.Wallet(privateKey, this.provider);
-      const signature = await wallet.signMessage(message);
-      return signature;
-    } catch (error) {
-      throw new Error(`Failed to sign message: ${error.message}`);
-    }
-  }
-
-  public async verifySignature(
-    message: string, 
-    signature: string, 
-    address: string
-  ): Promise<boolean> {
-    try {
-      const recoveredAddress = ethers.utils.verifyMessage(message, signature);
-      return recoveredAddress.toLowerCase() === address.toLowerCase();
-    } catch (error) {
-      throw new Error(`Signature verification failed: ${error.message}`);
-    }
-  }
-
-  public async encryptData(data: string): Promise<string> {
-    try {
-      return AES.encrypt(data, this.encryptionKey).toString();
-    } catch (error) {
-      throw new Error(`Encryption failed: ${error.message}`);
-    }
-  }
-
-  public async decryptData(encryptedData: string): Promise<string> {
-    try {
-      const bytes = AES.decrypt(encryptedData, this.encryptionKey);
-      return bytes.toString(enc.Utf8);
-    } catch (error) {
-      throw new Error(`Decryption failed: ${error.message}`);
-    }
-  }
-
-  public async generateNonce(address: string): Promise<number> {
-    const currentNonce = this.nonces.get(address) || 0;
-    const newNonce = currentNonce + 1;
-    this.nonces.set(address, newNonce);
-    return newNonce;
-  }
-
-  public async validateTransaction(
-    txHash: string,
-    expectedValue: string,
-    confirmations: number = 1
-  ): Promise<boolean> {
-    let retries = 0;
-    
-    while (retries < this.maxRetries) {
-      try {
-        const tx = await this.provider.getTransaction(txHash);
-        if (!tx) {
-          throw new Error('Transaction not found');
-        }
-
-        const receipt = await tx.wait(confirmations);
-        if (!receipt.status) {
-          throw new Error('Transaction failed');
-        }
-
-        return tx.value.toString() === expectedValue;
-      } catch (error) {
-        retries++;
-        if (retries === this.maxRetries) {
-          throw new Error(`Transaction validation failed: ${error.message}`);
-        }
-        await new Promise(resolve => setTimeout(resolve, this.timeoutMs));
+      if (!this.validators.has(block.proposer)) {
+        throw new Error('Invalid block proposer');
       }
+
+      const isValid = await this.validateBlock(block);
+      if (!isValid) {
+        throw new Error('Invalid block');
+      }
+
+      this.pendingBlocks.set(block.hash, block);
+      this.emit('blockProposed', block);
+
+      return {
+        valid: true,
+        hash: block.hash
+      };
+    } catch (error) {
+      this.logger.error('Block proposal failed', error);
+      return {
+        valid: false,
+        error: error.message
+      };
     }
-    return false;
   }
 
-  public generateHash(data: string): string {
+  public async validateBlock(block: Block): Promise<boolean> {
     try {
-      return keccak256(ethers.utils.toUtf8Bytes(data));
+      // Verify block hash
+      const calculatedHash = this.calculateBlockHash(block);
+      if (calculatedHash !== block.hash) {
+        return false;
+      }
+
+      // Verify previous block reference
+      if (block.previousHash !== this.chainHead) {
+        return false;
+      }
+
+      // Verify transactions
+      for (const tx of block.transactions) {
+        if (!await this.validateTransaction(tx)) {
+          return false;
+        }
+      }
+
+      // Verify block signature
+      return this.verifyBlockSignature(block);
+
     } catch (error) {
-      throw new Error(`Hash generation failed: ${error.message}`);
+      this.logger.error('Block validation failed', error);
+      return false;
     }
   }
 
-  public async validateAddress(address: string): Promise<boolean> {
+  private async validateTransaction(tx: Transaction): Promise<boolean> {
     try {
-      return ethers.utils.isAddress(address);
+      // Verify transaction signature
+      const signatureValid = crypto.verify(
+        Buffer.from(tx.hash),
+        Buffer.from(tx.signature, 'hex'),
+        Buffer.from(tx.publicKey, 'hex')
+      );
+
+      if (!signatureValid) {
+        return false;
+      }
+
+      // Additional transaction validation logic here
+      return true;
+
     } catch (error) {
-      throw new Error(`Address validation failed: ${error.message}`);
+      this.logger.error('Transaction validation failed', error);
+      return false;
     }
+  }
+
+  private calculateBlockHash(block: Block): string {
+    const blockData = {
+      previousHash: block.previousHash,
+      timestamp: block.timestamp,
+      transactions: block.transactions,
+      nonce: block.nonce
+    };
+    return SHA256(JSON.stringify(blockData)).toString();
+  }
+
+  private verifyBlockSignature(block: Block): boolean {
+    try {
+      const keyPair = ECPair.fromPublicKey(Buffer.from(block.proposer, 'hex'));
+      return keyPair.verify(
+        Buffer.from(block.hash),
+        Buffer.from(block.signature, 'hex')
+      );
+    } catch (error) {
+      this.logger.error('Block signature verification failed', error);
+      return false;
+    }
+  }
+
+  public async finalizeBlock(hash: string): Promise<void> {
+    const block = this.pendingBlocks.get(hash);
+    if (!block) {
+      throw new Error('Block not found');
+    }
+
+    this.currentBlock = block;
+    this.chainHead = block.hash;
+    this.pendingBlocks.delete(hash);
+    this.emit('blockFinalized', block);
+  }
+
+  public getCurrentBlock(): Block | null {
+    return this.currentBlock;
+  }
+
+  public getChainHead(): string {
+    return this.chainHead;
   }
 }
 ```
