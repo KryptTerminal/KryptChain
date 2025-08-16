@@ -13,11 +13,12 @@ export class CryptographicHash {
     iterations: number = 1
   ) {
     if (!['sha256', 'sha512', 'sha3-256', 'sha3-512'].includes(algorithm)) {
-      throw new Error('Invalid hashing algorithm specified');
+      throw new Error('Invalid hash algorithm specified');
     }
     if (iterations < 1) {
       throw new Error('Iterations must be greater than 0');
     }
+
     this.algorithm = algorithm;
     this.encoding = encoding;
     this.iterations = iterations;
@@ -25,65 +26,68 @@ export class CryptographicHash {
 
   public async hash(data: string | Buffer): Promise<string> {
     try {
-      let hash = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      let buffer: Buffer;
+      
+      if (typeof data === 'string') {
+        buffer = Buffer.from(data);
+      } else {
+        buffer = data;
+      }
 
+      let hash = buffer;
       for (let i = 0; i < this.iterations; i++) {
         hash = createHash(this.algorithm).update(hash).digest();
       }
 
       return hash.toString(this.encoding);
     } catch (error) {
-      throw new Error(`Hashing failed: ${(error as Error).message}`);
+      throw new Error(`Failed to generate hash: ${error.message}`);
     }
   }
 
-  public async hashWithSalt(
-    data: string | Buffer,
-    salt?: string | Buffer
-  ): Promise<{ hash: string; salt: string }> {
+  public async generateSalt(length: number = 32): Promise<string> {
     try {
-      const saltBuffer = salt
-        ? Buffer.isBuffer(salt)
-          ? salt
-          : Buffer.from(salt)
-        : randomBytes(32);
+      return new Promise((resolve, reject) => {
+        randomBytes(length, (err, buffer) => {
+          if (err) reject(err);
+          resolve(buffer.toString(this.encoding));
+        });
+      });
+    } catch (error) {
+      throw new Error(`Failed to generate salt: ${error.message}`);
+    }
+  }
 
-      const dataBuffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
-      const combinedBuffer = Buffer.concat([saltBuffer, dataBuffer]);
+  public async hashWithSalt(data: string, salt?: string): Promise<{hash: string, salt: string}> {
+    try {
+      const useSalt = salt || await this.generateSalt();
+      const combinedData = Buffer.concat([
+        Buffer.from(data),
+        Buffer.from(useSalt)
+      ]);
       
-      const hash = await this.hash(combinedBuffer);
-
+      const hashedData = await this.hash(combinedData);
+      
       return {
-        hash,
-        salt: saltBuffer.toString(this.encoding)
+        hash: hashedData,
+        salt: useSalt
       };
     } catch (error) {
-      throw new Error(`Salted hashing failed: ${(error as Error).message}`);
+      throw new Error(`Failed to generate salted hash: ${error.message}`);
     }
   }
 
-  public async verifyHash(
-    data: string | Buffer,
-    hash: string
-  ): Promise<boolean> {
+  public async verify(data: string, hash: string, salt?: string): Promise<boolean> {
     try {
-      const computedHash = await this.hash(data);
-      return computedHash === hash;
+      if (salt) {
+        const hashedData = await this.hashWithSalt(data, salt);
+        return hashedData.hash === hash;
+      }
+      
+      const hashedData = await this.hash(data);
+      return hashedData === hash;
     } catch (error) {
-      throw new Error(`Hash verification failed: ${(error as Error).message}`);
-    }
-  }
-
-  public async verifySaltedHash(
-    data: string | Buffer,
-    hash: string,
-    salt: string
-  ): Promise<boolean> {
-    try {
-      const { hash: computedHash } = await this.hashWithSalt(data, salt);
-      return computedHash === hash;
-    } catch (error) {
-      throw new Error(`Salted hash verification failed: ${(error as Error).message}`);
+      throw new Error(`Failed to verify hash: ${error.message}`);
     }
   }
 
@@ -92,33 +96,36 @@ export class CryptographicHash {
       const firstHash = await this.hash(data);
       return this.hash(firstHash);
     } catch (error) {
-      throw new Error(`Double hashing failed: ${(error as Error).message}`);
+      throw new Error(`Failed to generate double hash: ${error.message}`);
     }
   }
 
-  public async merkleHash(items: (string | Buffer)[]): Promise<string> {
+  public async merkleHash(dataArray: string[]): Promise<string> {
     try {
-      if (!items.length) {
+      if (!dataArray.length) {
         throw new Error('Empty array provided for Merkle hash');
       }
 
-      const hashes = await Promise.all(items.map(item => this.hash(item)));
+      const leaves = await Promise.all(dataArray.map(data => this.hash(data)));
       
-      while (hashes.length > 1) {
-        const temp: string[] = [];
-        for (let i = 0; i < hashes.length; i += 2) {
-          if (i + 1 === hashes.length) {
-            temp.push(await this.hash(hashes[i] + hashes[i]));
+      let level = leaves;
+      while (level.length > 1) {
+        const nextLevel: string[] = [];
+        for (let i = 0; i < level.length; i += 2) {
+          if (i + 1 === level.length) {
+            nextLevel.push(level[i]);
           } else {
-            temp.push(await this.hash(hashes[i] + hashes[i + 1]));
+            const combined = level[i] + level[i + 1];
+            const hash = await this.hash(combined);
+            nextLevel.push(hash);
           }
         }
-        hashes.splice(0, hashes.length, ...temp);
+        level = nextLevel;
       }
 
-      return hashes[0];
+      return level[0];
     } catch (error) {
-      throw new Error(`Merkle hash calculation failed: ${(error as Error).message}`);
+      throw new Error(`Failed to generate Merkle hash: ${error.message}`);
     }
   }
 }
