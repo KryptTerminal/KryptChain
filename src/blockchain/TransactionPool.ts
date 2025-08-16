@@ -1,128 +1,145 @@
 ```typescript
-import { Transaction } from './Transaction';
-import { Blockchain } from './Blockchain';
-import { EventEmitter } from 'events';
+import { Block, Transaction, ValidationResult } from './types';
 import { SHA256 } from 'crypto-js';
+import { EventEmitter } from 'events';
+import { ECPair, crypto } from 'bitcoinjs-lib';
+import { Logger } from './logger';
 
-interface PoolTransaction extends Transaction {
-  timestamp: number;
-  seen: Set<string>;
-}
+export class ConsensusEngine extends EventEmitter {
+  private readonly validators: Set<string>;
+  private readonly pendingBlocks: Map<string, Block>;
+  private currentBlock: Block | null;
+  private chainHead: string;
+  private readonly logger: Logger;
 
-export class TransactionPool extends EventEmitter {
-  private transactions: Map<string, PoolTransaction>;
-  private maxSize: number;
-  private blockchain: Blockchain;
-  private readonly MAX_AGE_MS = 3600000; // 1 hour
-  private readonly MAX_SIZE_BYTES = 5000000; // 5MB
-
-  constructor(blockchain: Blockchain, maxSize = 5000) {
+  constructor(validators: string[], chainHead: string) {
     super();
-    this.transactions = new Map();
-    this.maxSize = maxSize;
-    this.blockchain = blockchain;
+    this.validators = new Set(validators);
+    this.pendingBlocks = new Map();
+    this.currentBlock = null;
+    this.chainHead = chainHead;
+    this.logger = new Logger('ConsensusEngine');
   }
 
-  public async addTransaction(transaction: Transaction): Promise<boolean> {
+  public async proposeBlock(block: Block): Promise<ValidationResult> {
     try {
-      const txHash = this.getTransactionHash(transaction);
+      if (!this.validators.has(block.proposer)) {
+        throw new Error('Invalid block proposer');
+      }
 
-      if (this.transactions.has(txHash)) {
+      const isValid = await this.validateBlock(block);
+      if (!isValid) {
+        throw new Error('Invalid block');
+      }
+
+      this.pendingBlocks.set(block.hash, block);
+      this.emit('blockProposed', block);
+
+      return {
+        valid: true,
+        hash: block.hash
+      };
+    } catch (error) {
+      this.logger.error('Block proposal failed', error);
+      return {
+        valid: false,
+        error: error.message
+      };
+    }
+  }
+
+  public async validateBlock(block: Block): Promise<boolean> {
+    try {
+      // Verify block hash
+      const calculatedHash = this.calculateBlockHash(block);
+      if (calculatedHash !== block.hash) {
         return false;
       }
 
-      await this.validateTransaction(transaction);
-
-      if (this.getPoolSize() >= this.maxSize) {
-        this.removeOldestTransactions();
+      // Verify previous block reference
+      if (block.previousHash !== this.chainHead) {
+        return false;
       }
 
-      const poolTx: PoolTransaction = {
-        ...transaction,
-        timestamp: Date.now(),
-        seen: new Set()
-      };
+      // Verify transactions
+      for (const tx of block.transactions) {
+        if (!await this.validateTransaction(tx)) {
+          return false;
+        }
+      }
 
-      this.transactions.set(txHash, poolTx);
-      this.emit('transaction', transaction);
+      // Verify block signature
+      return this.verifyBlockSignature(block);
 
-      return true;
     } catch (error) {
-      this.emit('error', error);
+      this.logger.error('Block validation failed', error);
       return false;
     }
   }
 
-  public getTransaction(txHash: string): Transaction | undefined {
-    return this.transactions.get(txHash);
-  }
+  private async validateTransaction(tx: Transaction): Promise<boolean> {
+    try {
+      // Verify transaction signature
+      const signatureValid = crypto.verify(
+        Buffer.from(tx.hash),
+        Buffer.from(tx.signature, 'hex'),
+        Buffer.from(tx.publicKey, 'hex')
+      );
 
-  public getAllTransactions(): Transaction[] {
-    return Array.from(this.transactions.values());
-  }
-
-  public removeTransaction(txHash: string): boolean {
-    return this.transactions.delete(txHash);
-  }
-
-  public clear(): void {
-    this.transactions.clear();
-  }
-
-  public getPoolSize(): number {
-    return this.transactions.size;
-  }
-
-  private async validateTransaction(tx: Transaction): Promise<void> {
-    if (!tx.signature || !tx.fromAddress || !tx.toAddress || tx.amount <= 0) {
-      throw new Error('Invalid transaction format');
-    }
-
-    const isValid = await this.blockchain.verifyTransaction(tx);
-    if (!isValid) {
-      throw new Error('Transaction signature verification failed');
-    }
-
-    const senderBalance = await this.blockchain.getAddressBalance(tx.fromAddress);
-    if (senderBalance < tx.amount) {
-      throw new Error('Insufficient balance');
-    }
-
-    const txSize = this.getTransactionSize(tx);
-    if (txSize > this.MAX_SIZE_BYTES) {
-      throw new Error('Transaction size exceeds limit');
-    }
-  }
-
-  private getTransactionHash(tx: Transaction): string {
-    return SHA256(JSON.stringify({
-      fromAddress: tx.fromAddress,
-      toAddress: tx.toAddress,
-      amount: tx.amount,
-      timestamp: tx.timestamp
-    })).toString();
-  }
-
-  private getTransactionSize(tx: Transaction): number {
-    return Buffer.from(JSON.stringify(tx)).length;
-  }
-
-  private removeOldestTransactions(): void {
-    const now = Date.now();
-    for (const [hash, tx] of this.transactions.entries()) {
-      if (now - tx.timestamp > this.MAX_AGE_MS) {
-        this.transactions.delete(hash);
+      if (!signatureValid) {
+        return false;
       }
+
+      // Additional transaction validation logic here
+      return true;
+
+    } catch (error) {
+      this.logger.error('Transaction validation failed', error);
+      return false;
     }
   }
 
-  public async cleanPool(): Promise<void> {
-    const confirmedTxs = await this.blockchain.getConfirmedTransactions();
-    for (const tx of confirmedTxs) {
-      const txHash = this.getTransactionHash(tx);
-      this.transactions.delete(txHash);
+  private calculateBlockHash(block: Block): string {
+    const blockData = {
+      previousHash: block.previousHash,
+      timestamp: block.timestamp,
+      transactions: block.transactions,
+      nonce: block.nonce
+    };
+    return SHA256(JSON.stringify(blockData)).toString();
+  }
+
+  private verifyBlockSignature(block: Block): boolean {
+    try {
+      const keyPair = ECPair.fromPublicKey(Buffer.from(block.proposer, 'hex'));
+      return keyPair.verify(
+        Buffer.from(block.hash),
+        Buffer.from(block.signature, 'hex')
+      );
+    } catch (error) {
+      this.logger.error('Block signature verification failed', error);
+      return false;
     }
-    this.removeOldestTransactions();
+  }
+
+  public async finalizeBlock(hash: string): Promise<void> {
+    const block = this.pendingBlocks.get(hash);
+    if (!block) {
+      throw new Error('Block not found');
+    }
+
+    this.currentBlock = block;
+    this.chainHead = block.hash;
+    this.pendingBlocks.delete(hash);
+    this.emit('blockFinalized', block);
+  }
+
+  public getCurrentBlock(): Block | null {
+    return this.currentBlock;
+  }
+
+  public getChainHead(): string {
+    return this.chainHead;
   }
 }
 ```
