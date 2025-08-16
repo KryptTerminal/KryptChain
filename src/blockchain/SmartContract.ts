@@ -1,123 +1,145 @@
 ```typescript
-import { ethers, Contract, Signer, BigNumber } from 'ethers';
-import { TransactionResponse, TransactionReceipt } from '@ethersproject/abstract-provider';
+import { Block, Transaction, ValidationResult } from './types';
+import { SHA256 } from 'crypto-js';
+import { EventEmitter } from 'events';
+import { ECPair, crypto } from 'bitcoinjs-lib';
+import { Logger } from './logger';
 
-export interface ISmartContractConfig {
-  address: string;
-  abi: any[];
-  provider: ethers.providers.Provider;
-  signer?: Signer;
-}
+export class ConsensusEngine extends EventEmitter {
+  private readonly validators: Set<string>;
+  private readonly pendingBlocks: Map<string, Block>;
+  private currentBlock: Block | null;
+  private chainHead: string;
+  private readonly logger: Logger;
 
-export class SmartContract {
-  private readonly contract: Contract;
-  private readonly address: string;
-  private readonly signer?: Signer;
-  
-  constructor(config: ISmartContractConfig) {
-    this.address = ethers.utils.getAddress(config.address); // Checksum address
-    this.signer = config.signer;
-    
-    this.contract = new ethers.Contract(
-      this.address,
-      config.abi,
-      this.signer || config.provider
-    );
+  constructor(validators: string[], chainHead: string) {
+    super();
+    this.validators = new Set(validators);
+    this.pendingBlocks = new Map();
+    this.currentBlock = null;
+    this.chainHead = chainHead;
+    this.logger = new Logger('ConsensusEngine');
   }
 
-  public async call<T>(
-    method: string,
-    args: any[] = [],
-    options: {gasLimit?: number; value?: BigNumber} = {}
-  ): Promise<T> {
+  public async proposeBlock(block: Block): Promise<ValidationResult> {
     try {
-      if (!this.contract[method]) {
-        throw new Error(`Method ${method} not found on contract`);
+      if (!this.validators.has(block.proposer)) {
+        throw new Error('Invalid block proposer');
       }
 
-      const result = await this.contract[method](...args, options);
-      return result as T;
-      
-    } catch (error) {
-      throw this.handleError(error);
-    }
-  }
-
-  public async send(
-    method: string,
-    args: any[] = [],
-    options: {gasLimit?: number; value?: BigNumber} = {}
-  ): Promise<TransactionReceipt> {
-    try {
-      if (!this.signer) {
-        throw new Error('Signer required for transaction');
+      const isValid = await this.validateBlock(block);
+      if (!isValid) {
+        throw new Error('Invalid block');
       }
 
-      if (!this.contract[method]) {
-        throw new Error(`Method ${method} not found on contract`);
+      this.pendingBlocks.set(block.hash, block);
+      this.emit('blockProposed', block);
+
+      return {
+        valid: true,
+        hash: block.hash
+      };
+    } catch (error) {
+      this.logger.error('Block proposal failed', error);
+      return {
+        valid: false,
+        error: error.message
+      };
+    }
+  }
+
+  public async validateBlock(block: Block): Promise<boolean> {
+    try {
+      // Verify block hash
+      const calculatedHash = this.calculateBlockHash(block);
+      if (calculatedHash !== block.hash) {
+        return false;
       }
 
-      const tx: TransactionResponse = await this.contract[method](...args, options);
-      const receipt = await tx.wait();
-      
-      return receipt;
-
-    } catch (error) {
-      throw this.handleError(error);
-    }
-  }
-
-  public async estimateGas(
-    method: string,
-    args: any[] = [],
-    options: {value?: BigNumber} = {}
-  ): Promise<BigNumber> {
-    try {
-      if (!this.contract[method]) {
-        throw new Error(`Method ${method} not found on contract`);
+      // Verify previous block reference
+      if (block.previousHash !== this.chainHead) {
+        return false;
       }
 
-      const estimate = await this.contract.estimateGas[method](...args, options);
-      return estimate;
+      // Verify transactions
+      for (const tx of block.transactions) {
+        if (!await this.validateTransaction(tx)) {
+          return false;
+        }
+      }
+
+      // Verify block signature
+      return this.verifyBlockSignature(block);
 
     } catch (error) {
-      throw this.handleError(error);
+      this.logger.error('Block validation failed', error);
+      return false;
     }
   }
 
-  public async getBalance(): Promise<BigNumber> {
+  private async validateTransaction(tx: Transaction): Promise<boolean> {
     try {
-      const balance = await this.contract.provider.getBalance(this.address);
-      return balance;
+      // Verify transaction signature
+      const signatureValid = crypto.verify(
+        Buffer.from(tx.hash),
+        Buffer.from(tx.signature, 'hex'),
+        Buffer.from(tx.publicKey, 'hex')
+      );
+
+      if (!signatureValid) {
+        return false;
+      }
+
+      // Additional transaction validation logic here
+      return true;
+
     } catch (error) {
-      throw this.handleError(error);
+      this.logger.error('Transaction validation failed', error);
+      return false;
     }
   }
 
-  public getAddress(): string {
-    return this.address;
+  private calculateBlockHash(block: Block): string {
+    const blockData = {
+      previousHash: block.previousHash,
+      timestamp: block.timestamp,
+      transactions: block.transactions,
+      nonce: block.nonce
+    };
+    return SHA256(JSON.stringify(blockData)).toString();
   }
 
-  private handleError(error: any): Error {
-    // Handle common contract errors
-    if (error.code === 'CALL_EXCEPTION') {
-      return new Error(`Contract call failed: ${error.reason || 'Unknown reason'}`);
+  private verifyBlockSignature(block: Block): boolean {
+    try {
+      const keyPair = ECPair.fromPublicKey(Buffer.from(block.proposer, 'hex'));
+      return keyPair.verify(
+        Buffer.from(block.hash),
+        Buffer.from(block.signature, 'hex')
+      );
+    } catch (error) {
+      this.logger.error('Block signature verification failed', error);
+      return false;
     }
-    
-    if (error.code === 'INSUFFICIENT_FUNDS') {
-      return new Error('Insufficient funds for transaction');
+  }
+
+  public async finalizeBlock(hash: string): Promise<void> {
+    const block = this.pendingBlocks.get(hash);
+    if (!block) {
+      throw new Error('Block not found');
     }
 
-    if (error.code === 'UNPREDICTABLE_GAS_LIMIT') {
-      return new Error('Unable to estimate gas limit');
-    }
+    this.currentBlock = block;
+    this.chainHead = block.hash;
+    this.pendingBlocks.delete(hash);
+    this.emit('blockFinalized', block);
+  }
 
-    if (error.code === 'NONCE_EXPIRED') {
-      return new Error('Transaction nonce has expired');
-    }
+  public getCurrentBlock(): Block | null {
+    return this.currentBlock;
+  }
 
-    // Return original error if unhandled
-    return error;
+  public getChainHead(): string {
+    return this.chainHead;
   }
 }
 ```
