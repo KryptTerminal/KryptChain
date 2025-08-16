@@ -1,134 +1,145 @@
 ```typescript
-import { ethers } from 'ethers';
-import { Buffer } from 'buffer';
-import {
-  IWalletManager,
-  WalletConfig,
-  Network,
-  TransactionParams,
-  WalletBalances
-} from './types';
+import { Block, Transaction, ValidationResult } from './types';
+import { SHA256 } from 'crypto-js';
+import { EventEmitter } from 'events';
+import { ECPair, crypto } from 'bitcoinjs-lib';
+import { Logger } from './logger';
 
-export class WalletManager implements IWalletManager {
-  private readonly provider: ethers.providers.Provider;
-  private wallet: ethers.Wallet | null = null;
-  private readonly networkConfig: Network;
-  private readonly encryptionKey: Buffer;
+export class ConsensusEngine extends EventEmitter {
+  private readonly validators: Set<string>;
+  private readonly pendingBlocks: Map<string, Block>;
+  private currentBlock: Block | null;
+  private chainHead: string;
+  private readonly logger: Logger;
 
-  constructor(config: WalletConfig) {
-    this.provider = new ethers.providers.JsonRpcProvider(config.rpcUrl);
-    this.networkConfig = config.network;
-    this.encryptionKey = Buffer.from(config.encryptionKey, 'hex');
+  constructor(validators: string[], chainHead: string) {
+    super();
+    this.validators = new Set(validators);
+    this.pendingBlocks = new Map();
+    this.currentBlock = null;
+    this.chainHead = chainHead;
+    this.logger = new Logger('ConsensusEngine');
   }
 
-  public async createWallet(): Promise<string> {
+  public async proposeBlock(block: Block): Promise<ValidationResult> {
     try {
-      const wallet = ethers.Wallet.createRandom();
-      this.wallet = wallet.connect(this.provider);
-      const encryptedKey = await this.encryptPrivateKey(wallet.privateKey);
-      return wallet.address;
-    } catch (error) {
-      throw new Error(`Failed to create wallet: ${error.message}`);
-    }
-  }
+      if (!this.validators.has(block.proposer)) {
+        throw new Error('Invalid block proposer');
+      }
 
-  public async importWallet(privateKey: string): Promise<string> {
-    try {
-      const wallet = new ethers.Wallet(privateKey, this.provider);
-      this.wallet = wallet;
-      const encryptedKey = await this.encryptPrivateKey(privateKey);
-      return wallet.address;
-    } catch (error) {
-      throw new Error(`Failed to import wallet: ${error.message}`);
-    }
-  }
+      const isValid = await this.validateBlock(block);
+      if (!isValid) {
+        throw new Error('Invalid block');
+      }
 
-  public async getBalance(): Promise<WalletBalances> {
-    if (!this.wallet) {
-      throw new Error('No wallet initialized');
-    }
-
-    try {
-      const ethBalance = await this.wallet.getBalance();
-      const tokenBalances = await this.getTokenBalances();
+      this.pendingBlocks.set(block.hash, block);
+      this.emit('blockProposed', block);
 
       return {
-        eth: ethers.utils.formatEther(ethBalance),
-        tokens: tokenBalances
+        valid: true,
+        hash: block.hash
       };
     } catch (error) {
-      throw new Error(`Failed to get balances: ${error.message}`);
+      this.logger.error('Block proposal failed', error);
+      return {
+        valid: false,
+        error: error.message
+      };
     }
   }
 
-  public async sendTransaction(params: TransactionParams): Promise<string> {
-    if (!this.wallet) {
-      throw new Error('No wallet initialized');
-    }
-
+  public async validateBlock(block: Block): Promise<boolean> {
     try {
-      const tx = await this.wallet.sendTransaction({
-        to: params.to,
-        value: ethers.utils.parseEther(params.value.toString()),
-        gasLimit: params.gasLimit,
-        gasPrice: await this.provider.getGasPrice()
-      });
+      // Verify block hash
+      const calculatedHash = this.calculateBlockHash(block);
+      if (calculatedHash !== block.hash) {
+        return false;
+      }
 
-      const receipt = await tx.wait();
-      return receipt.transactionHash;
+      // Verify previous block reference
+      if (block.previousHash !== this.chainHead) {
+        return false;
+      }
+
+      // Verify transactions
+      for (const tx of block.transactions) {
+        if (!await this.validateTransaction(tx)) {
+          return false;
+        }
+      }
+
+      // Verify block signature
+      return this.verifyBlockSignature(block);
+
     } catch (error) {
-      throw new Error(`Transaction failed: ${error.message}`);
+      this.logger.error('Block validation failed', error);
+      return false;
     }
   }
 
-  public async signMessage(message: string): Promise<string> {
-    if (!this.wallet) {
-      throw new Error('No wallet initialized');
-    }
-
+  private async validateTransaction(tx: Transaction): Promise<boolean> {
     try {
-      return await this.wallet.signMessage(message);
-    } catch (error) {
-      throw new Error(`Failed to sign message: ${error.message}`);
-    }
-  }
-
-  private async encryptPrivateKey(privateKey: string): Promise<Buffer> {
-    try {
-      const cipher = await import('crypto').then(crypto => 
-        crypto.createCipheriv('aes-256-gcm', this.encryptionKey, Buffer.alloc(16, 0))
+      // Verify transaction signature
+      const signatureValid = crypto.verify(
+        Buffer.from(tx.hash),
+        Buffer.from(tx.signature, 'hex'),
+        Buffer.from(tx.publicKey, 'hex')
       );
-      
-      const encrypted = Buffer.concat([
-        cipher.update(Buffer.from(privateKey)),
-        cipher.final()
-      ]);
 
-      return Buffer.concat([encrypted, cipher.getAuthTag()]);
+      if (!signatureValid) {
+        return false;
+      }
+
+      // Additional transaction validation logic here
+      return true;
+
     } catch (error) {
-      throw new Error(`Encryption failed: ${error.message}`);
+      this.logger.error('Transaction validation failed', error);
+      return false;
     }
   }
 
-  private async getTokenBalances(): Promise<Record<string, string>> {
-    // Implementation would check ERC20 token balances
-    // This is a simplified version
-    return {};
+  private calculateBlockHash(block: Block): string {
+    const blockData = {
+      previousHash: block.previousHash,
+      timestamp: block.timestamp,
+      transactions: block.transactions,
+      nonce: block.nonce
+    };
+    return SHA256(JSON.stringify(blockData)).toString();
   }
 
-  public getAddress(): string {
-    if (!this.wallet) {
-      throw new Error('No wallet initialized');
+  private verifyBlockSignature(block: Block): boolean {
+    try {
+      const keyPair = ECPair.fromPublicKey(Buffer.from(block.proposer, 'hex'));
+      return keyPair.verify(
+        Buffer.from(block.hash),
+        Buffer.from(block.signature, 'hex')
+      );
+    } catch (error) {
+      this.logger.error('Block signature verification failed', error);
+      return false;
     }
-    return this.wallet.address;
   }
 
-  public async disconnect(): Promise<void> {
-    this.wallet = null;
+  public async finalizeBlock(hash: string): Promise<void> {
+    const block = this.pendingBlocks.get(hash);
+    if (!block) {
+      throw new Error('Block not found');
+    }
+
+    this.currentBlock = block;
+    this.chainHead = block.hash;
+    this.pendingBlocks.delete(hash);
+    this.emit('blockFinalized', block);
   }
 
-  public isConnected(): boolean {
-    return this.wallet !== null;
+  public getCurrentBlock(): Block | null {
+    return this.currentBlock;
+  }
+
+  public getChainHead(): string {
+    return this.chainHead;
   }
 }
 ```
