@@ -1,142 +1,145 @@
 ```typescript
-import { Hash, Block, Transaction, Address, Account } from './types';
-import { createHash } from 'crypto';
-import { LRUCache } from './cache';
-import { DatabaseClient } from './database';
-import { ValidationError, StateError } from './errors';
+import { Block, Transaction, ValidationResult } from './types';
+import { SHA256 } from 'crypto-js';
+import { EventEmitter } from 'events';
+import { ECPair, crypto } from 'bitcoinjs-lib';
+import { Logger } from './logger';
 
-export class StateManager {
-  private readonly stateCache: LRUCache<string, Account>;
-  private readonly blockCache: LRUCache<Hash, Block>;
-  private readonly db: DatabaseClient;
-  private currentBlock: Block;
+export class ConsensusEngine extends EventEmitter {
+  private readonly validators: Set<string>;
+  private readonly pendingBlocks: Map<string, Block>;
+  private currentBlock: Block | null;
+  private chainHead: string;
+  private readonly logger: Logger;
 
-  constructor(dbClient: DatabaseClient, cacheSize = 1000) {
-    this.stateCache = new LRUCache<string, Account>(cacheSize);
-    this.blockCache = new LRUCache<Hash, Block>(100);
-    this.db = dbClient;
+  constructor(validators: string[], chainHead: string) {
+    super();
+    this.validators = new Set(validators);
+    this.pendingBlocks = new Map();
+    this.currentBlock = null;
+    this.chainHead = chainHead;
+    this.logger = new Logger('ConsensusEngine');
   }
 
-  public async initialize(): Promise<void> {
+  public async proposeBlock(block: Block): Promise<ValidationResult> {
     try {
-      this.currentBlock = await this.db.getLatestBlock();
-      if (!this.currentBlock) {
-        throw new StateError('Failed to initialize state manager');
+      if (!this.validators.has(block.proposer)) {
+        throw new Error('Invalid block proposer');
       }
+
+      const isValid = await this.validateBlock(block);
+      if (!isValid) {
+        throw new Error('Invalid block');
+      }
+
+      this.pendingBlocks.set(block.hash, block);
+      this.emit('blockProposed', block);
+
+      return {
+        valid: true,
+        hash: block.hash
+      };
     } catch (error) {
-      throw new StateError(`State initialization failed: ${error.message}`);
+      this.logger.error('Block proposal failed', error);
+      return {
+        valid: false,
+        error: error.message
+      };
     }
   }
 
-  public async getAccount(address: Address): Promise<Account> {
+  public async validateBlock(block: Block): Promise<boolean> {
     try {
-      const cachedAccount = this.stateCache.get(address.toString());
-      if (cachedAccount) {
-        return cachedAccount;
+      // Verify block hash
+      const calculatedHash = this.calculateBlockHash(block);
+      if (calculatedHash !== block.hash) {
+        return false;
       }
 
-      const account = await this.db.getAccount(address);
-      if (!account) {
-        return this.createEmptyAccount(address);
+      // Verify previous block reference
+      if (block.previousHash !== this.chainHead) {
+        return false;
       }
 
-      this.stateCache.set(address.toString(), account);
-      return account;
-    } catch (error) {
-      throw new StateError(`Failed to get account: ${error.message}`);
-    }
-  }
-
-  public async updateAccount(address: Address, account: Account): Promise<void> {
-    try {
-      await this.validateAccount(account);
-      await this.db.updateAccount(address, account);
-      this.stateCache.set(address.toString(), account);
-    } catch (error) {
-      throw new StateError(`Failed to update account: ${error.message}`);
-    }
-  }
-
-  public async applyTransaction(tx: Transaction): Promise<void> {
-    try {
-      const sender = await this.getAccount(tx.from);
-      const recipient = await this.getAccount(tx.to);
-
-      if (sender.balance < tx.value + tx.fee) {
-        throw new ValidationError('Insufficient balance');
-      }
-
-      sender.balance -= (tx.value + tx.fee);
-      sender.nonce += 1;
-      recipient.balance += tx.value;
-
-      await this.updateAccount(tx.from, sender);
-      await this.updateAccount(tx.to, recipient);
-    } catch (error) {
-      throw new StateError(`Transaction application failed: ${error.message}`);
-    }
-  }
-
-  public async commitBlock(block: Block): Promise<void> {
-    try {
+      // Verify transactions
       for (const tx of block.transactions) {
-        await this.applyTransaction(tx);
+        if (!await this.validateTransaction(tx)) {
+          return false;
+        }
       }
 
-      this.currentBlock = block;
-      this.blockCache.set(block.hash, block);
-      await this.db.saveBlock(block);
+      // Verify block signature
+      return this.verifyBlockSignature(block);
+
     } catch (error) {
-      throw new StateError(`Block commit failed: ${error.message}`);
+      this.logger.error('Block validation failed', error);
+      return false;
     }
   }
 
-  public async revertBlock(blockHash: Hash): Promise<void> {
+  private async validateTransaction(tx: Transaction): Promise<boolean> {
     try {
-      const block = await this.getBlock(blockHash);
-      for (const tx of block.transactions.reverse()) {
-        await this.revertTransaction(tx);
+      // Verify transaction signature
+      const signatureValid = crypto.verify(
+        Buffer.from(tx.hash),
+        Buffer.from(tx.signature, 'hex'),
+        Buffer.from(tx.publicKey, 'hex')
+      );
+
+      if (!signatureValid) {
+        return false;
       }
-      this.currentBlock = await this.getBlock(block.parentHash);
+
+      // Additional transaction validation logic here
+      return true;
+
     } catch (error) {
-      throw new StateError(`Block revert failed: ${error.message}`);
+      this.logger.error('Transaction validation failed', error);
+      return false;
     }
   }
 
-  private async validateAccount(account: Account): Promise<void> {
-    if (account.balance < 0 || account.nonce < 0) {
-      throw new ValidationError('Invalid account state');
-    }
-  }
-
-  private createEmptyAccount(address: Address): Account {
-    return {
-      address,
-      balance: 0n,
-      nonce: 0,
-      codeHash: createHash('sha256').update('').digest('hex'),
-      storageRoot: createHash('sha256').update('').digest('hex')
+  private calculateBlockHash(block: Block): string {
+    const blockData = {
+      previousHash: block.previousHash,
+      timestamp: block.timestamp,
+      transactions: block.transactions,
+      nonce: block.nonce
     };
+    return SHA256(JSON.stringify(blockData)).toString();
   }
 
-  private async getBlock(hash: Hash): Promise<Block> {
-    const cached = this.blockCache.get(hash);
-    if (cached) {
-      return cached;
+  private verifyBlockSignature(block: Block): boolean {
+    try {
+      const keyPair = ECPair.fromPublicKey(Buffer.from(block.proposer, 'hex'));
+      return keyPair.verify(
+        Buffer.from(block.hash),
+        Buffer.from(block.signature, 'hex')
+      );
+    } catch (error) {
+      this.logger.error('Block signature verification failed', error);
+      return false;
     }
-    return await this.db.getBlock(hash);
   }
 
-  private async revertTransaction(tx: Transaction): Promise<void> {
-    const sender = await this.getAccount(tx.from);
-    const recipient = await this.getAccount(tx.to);
+  public async finalizeBlock(hash: string): Promise<void> {
+    const block = this.pendingBlocks.get(hash);
+    if (!block) {
+      throw new Error('Block not found');
+    }
 
-    sender.balance += (tx.value + tx.fee);
-    sender.nonce -= 1;
-    recipient.balance -= tx.value;
+    this.currentBlock = block;
+    this.chainHead = block.hash;
+    this.pendingBlocks.delete(hash);
+    this.emit('blockFinalized', block);
+  }
 
-    await this.updateAccount(tx.from, sender);
-    await this.updateAccount(tx.to, recipient);
+  public getCurrentBlock(): Block | null {
+    return this.currentBlock;
+  }
+
+  public getChainHead(): string {
+    return this.chainHead;
   }
 }
 ```
