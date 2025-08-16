@@ -1,132 +1,145 @@
 ```typescript
-import { createHash, randomBytes } from 'crypto';
-import { Buffer } from 'buffer';
+import { Block, Transaction, ValidationResult } from './types';
+import { SHA256 } from 'crypto-js';
+import { EventEmitter } from 'events';
+import { ECPair, crypto } from 'bitcoinjs-lib';
+import { Logger } from './logger';
 
-export class CryptographicHash {
-  private readonly algorithm: string;
-  private readonly encoding: BufferEncoding;
-  private readonly iterations: number;
+export class ConsensusEngine extends EventEmitter {
+  private readonly validators: Set<string>;
+  private readonly pendingBlocks: Map<string, Block>;
+  private currentBlock: Block | null;
+  private chainHead: string;
+  private readonly logger: Logger;
 
-  constructor(
-    algorithm: string = 'sha256',
-    encoding: BufferEncoding = 'hex',
-    iterations: number = 1
-  ) {
-    if (!['sha256', 'sha512', 'sha3-256', 'sha3-512'].includes(algorithm)) {
-      throw new Error('Invalid hash algorithm specified');
-    }
-    if (iterations < 1) {
-      throw new Error('Iterations must be greater than 0');
-    }
-
-    this.algorithm = algorithm;
-    this.encoding = encoding;
-    this.iterations = iterations;
+  constructor(validators: string[], chainHead: string) {
+    super();
+    this.validators = new Set(validators);
+    this.pendingBlocks = new Map();
+    this.currentBlock = null;
+    this.chainHead = chainHead;
+    this.logger = new Logger('ConsensusEngine');
   }
 
-  public async hash(data: string | Buffer): Promise<string> {
+  public async proposeBlock(block: Block): Promise<ValidationResult> {
     try {
-      let buffer: Buffer;
-      
-      if (typeof data === 'string') {
-        buffer = Buffer.from(data);
-      } else {
-        buffer = data;
+      if (!this.validators.has(block.proposer)) {
+        throw new Error('Invalid block proposer');
       }
 
-      let hash = buffer;
-      for (let i = 0; i < this.iterations; i++) {
-        hash = createHash(this.algorithm).update(hash).digest();
+      const isValid = await this.validateBlock(block);
+      if (!isValid) {
+        throw new Error('Invalid block');
       }
 
-      return hash.toString(this.encoding);
-    } catch (error) {
-      throw new Error(`Failed to generate hash: ${error.message}`);
-    }
-  }
+      this.pendingBlocks.set(block.hash, block);
+      this.emit('blockProposed', block);
 
-  public async generateSalt(length: number = 32): Promise<string> {
-    try {
-      return new Promise((resolve, reject) => {
-        randomBytes(length, (err, buffer) => {
-          if (err) reject(err);
-          resolve(buffer.toString(this.encoding));
-        });
-      });
-    } catch (error) {
-      throw new Error(`Failed to generate salt: ${error.message}`);
-    }
-  }
-
-  public async hashWithSalt(data: string, salt?: string): Promise<{hash: string, salt: string}> {
-    try {
-      const useSalt = salt || await this.generateSalt();
-      const combinedData = Buffer.concat([
-        Buffer.from(data),
-        Buffer.from(useSalt)
-      ]);
-      
-      const hashedData = await this.hash(combinedData);
-      
       return {
-        hash: hashedData,
-        salt: useSalt
+        valid: true,
+        hash: block.hash
       };
     } catch (error) {
-      throw new Error(`Failed to generate salted hash: ${error.message}`);
+      this.logger.error('Block proposal failed', error);
+      return {
+        valid: false,
+        error: error.message
+      };
     }
   }
 
-  public async verify(data: string, hash: string, salt?: string): Promise<boolean> {
+  public async validateBlock(block: Block): Promise<boolean> {
     try {
-      if (salt) {
-        const hashedData = await this.hashWithSalt(data, salt);
-        return hashedData.hash === hash;
-      }
-      
-      const hashedData = await this.hash(data);
-      return hashedData === hash;
-    } catch (error) {
-      throw new Error(`Failed to verify hash: ${error.message}`);
-    }
-  }
-
-  public async doubleHash(data: string | Buffer): Promise<string> {
-    try {
-      const firstHash = await this.hash(data);
-      return this.hash(firstHash);
-    } catch (error) {
-      throw new Error(`Failed to generate double hash: ${error.message}`);
-    }
-  }
-
-  public async merkleHash(dataArray: string[]): Promise<string> {
-    try {
-      if (!dataArray.length) {
-        throw new Error('Empty array provided for Merkle hash');
+      // Verify block hash
+      const calculatedHash = this.calculateBlockHash(block);
+      if (calculatedHash !== block.hash) {
+        return false;
       }
 
-      const leaves = await Promise.all(dataArray.map(data => this.hash(data)));
-      
-      let level = leaves;
-      while (level.length > 1) {
-        const nextLevel: string[] = [];
-        for (let i = 0; i < level.length; i += 2) {
-          if (i + 1 === level.length) {
-            nextLevel.push(level[i]);
-          } else {
-            const combined = level[i] + level[i + 1];
-            const hash = await this.hash(combined);
-            nextLevel.push(hash);
-          }
+      // Verify previous block reference
+      if (block.previousHash !== this.chainHead) {
+        return false;
+      }
+
+      // Verify transactions
+      for (const tx of block.transactions) {
+        if (!await this.validateTransaction(tx)) {
+          return false;
         }
-        level = nextLevel;
       }
 
-      return level[0];
+      // Verify block signature
+      return this.verifyBlockSignature(block);
+
     } catch (error) {
-      throw new Error(`Failed to generate Merkle hash: ${error.message}`);
+      this.logger.error('Block validation failed', error);
+      return false;
     }
+  }
+
+  private async validateTransaction(tx: Transaction): Promise<boolean> {
+    try {
+      // Verify transaction signature
+      const signatureValid = crypto.verify(
+        Buffer.from(tx.hash),
+        Buffer.from(tx.signature, 'hex'),
+        Buffer.from(tx.publicKey, 'hex')
+      );
+
+      if (!signatureValid) {
+        return false;
+      }
+
+      // Additional transaction validation logic here
+      return true;
+
+    } catch (error) {
+      this.logger.error('Transaction validation failed', error);
+      return false;
+    }
+  }
+
+  private calculateBlockHash(block: Block): string {
+    const blockData = {
+      previousHash: block.previousHash,
+      timestamp: block.timestamp,
+      transactions: block.transactions,
+      nonce: block.nonce
+    };
+    return SHA256(JSON.stringify(blockData)).toString();
+  }
+
+  private verifyBlockSignature(block: Block): boolean {
+    try {
+      const keyPair = ECPair.fromPublicKey(Buffer.from(block.proposer, 'hex'));
+      return keyPair.verify(
+        Buffer.from(block.hash),
+        Buffer.from(block.signature, 'hex')
+      );
+    } catch (error) {
+      this.logger.error('Block signature verification failed', error);
+      return false;
+    }
+  }
+
+  public async finalizeBlock(hash: string): Promise<void> {
+    const block = this.pendingBlocks.get(hash);
+    if (!block) {
+      throw new Error('Block not found');
+    }
+
+    this.currentBlock = block;
+    this.chainHead = block.hash;
+    this.pendingBlocks.delete(hash);
+    this.emit('blockFinalized', block);
+  }
+
+  public getCurrentBlock(): Block | null {
+    return this.currentBlock;
+  }
+
+  public getChainHead(): string {
+    return this.chainHead;
   }
 }
 ```
