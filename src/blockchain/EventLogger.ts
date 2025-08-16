@@ -1,148 +1,145 @@
 ```typescript
-import { ethers } from 'ethers';
-import { Logger } from 'winston';
+import { Block, Transaction, ValidationResult } from './types';
+import { SHA256 } from 'crypto-js';
 import { EventEmitter } from 'events';
-import { keccak256 } from 'ethers/lib/utils';
+import { ECPair, crypto } from 'bitcoinjs-lib';
+import { Logger } from './logger';
 
-interface EventLoggerConfig {
-  provider: ethers.providers.Provider;
-  logger?: Logger;
-  maxRetries?: number;
-  retryDelay?: number;
-}
+export class ConsensusEngine extends EventEmitter {
+  private readonly validators: Set<string>;
+  private readonly pendingBlocks: Map<string, Block>;
+  private currentBlock: Block | null;
+  private chainHead: string;
+  private readonly logger: Logger;
 
-interface EventLog {
-  eventName: string;
-  blockNumber: number;
-  transactionHash: string;
-  timestamp: number;
-  data: any;
-}
-
-export class BlockchainEventLogger extends EventEmitter {
-  private readonly provider: ethers.providers.Provider;
-  private readonly logger?: Logger;
-  private readonly maxRetries: number;
-  private readonly retryDelay: number;
-  private isRunning: boolean = false;
-  private lastProcessedBlock: number = 0;
-
-  constructor(config: EventLoggerConfig) {
+  constructor(validators: string[], chainHead: string) {
     super();
-    this.provider = config.provider;
-    this.logger = config.logger;
-    this.maxRetries = config.maxRetries || 3;
-    this.retryDelay = config.retryDelay || 1000;
+    this.validators = new Set(validators);
+    this.pendingBlocks = new Map();
+    this.currentBlock = null;
+    this.chainHead = chainHead;
+    this.logger = new Logger('ConsensusEngine');
   }
 
-  public async start(fromBlock?: number): Promise<void> {
-    if (this.isRunning) {
-      throw new Error('EventLogger is already running');
-    }
-
-    this.isRunning = true;
-    this.lastProcessedBlock = fromBlock || await this.provider.getBlockNumber();
-
+  public async proposeBlock(block: Block): Promise<ValidationResult> {
     try {
-      await this.processPendingEvents();
-      await this.subscribeToNewEvents();
+      if (!this.validators.has(block.proposer)) {
+        throw new Error('Invalid block proposer');
+      }
+
+      const isValid = await this.validateBlock(block);
+      if (!isValid) {
+        throw new Error('Invalid block');
+      }
+
+      this.pendingBlocks.set(block.hash, block);
+      this.emit('blockProposed', block);
+
+      return {
+        valid: true,
+        hash: block.hash
+      };
     } catch (error) {
-      this.isRunning = false;
-      this.handleError('Failed to start event logger', error);
-      throw error;
+      this.logger.error('Block proposal failed', error);
+      return {
+        valid: false,
+        error: error.message
+      };
     }
   }
 
-  public async stop(): Promise<void> {
-    this.isRunning = false;
-    this.removeAllListeners();
-    this.logger?.info('EventLogger stopped');
-  }
-
-  private async processPendingEvents(): Promise<void> {
-    const currentBlock = await this.provider.getBlockNumber();
-    
-    for (let blockNumber = this.lastProcessedBlock; blockNumber <= currentBlock; blockNumber++) {
-      if (!this.isRunning) break;
-      
-      await this.processBlockWithRetry(blockNumber);
-    }
-  }
-
-  private async processBlockWithRetry(blockNumber: number, attempt: number = 1): Promise<void> {
+  public async validateBlock(block: Block): Promise<boolean> {
     try {
-      const block = await this.provider.getBlock(blockNumber, true);
-      if (!block) return;
+      // Verify block hash
+      const calculatedHash = this.calculateBlockHash(block);
+      if (calculatedHash !== block.hash) {
+        return false;
+      }
 
+      // Verify previous block reference
+      if (block.previousHash !== this.chainHead) {
+        return false;
+      }
+
+      // Verify transactions
       for (const tx of block.transactions) {
-        if (typeof tx === 'string') continue;
-        
-        const receipt = await this.provider.getTransactionReceipt(tx.hash);
-        if (!receipt) continue;
-
-        for (const log of receipt.logs) {
-          const eventLog: EventLog = {
-            eventName: this.decodeEventName(log),
-            blockNumber: log.blockNumber,
-            transactionHash: log.transactionHash,
-            timestamp: block.timestamp,
-            data: this.decodeEventData(log)
-          };
-
-          this.emit('event', eventLog);
-          this.logger?.debug('Event processed', eventLog);
+        if (!await this.validateTransaction(tx)) {
+          return false;
         }
       }
 
-      this.lastProcessedBlock = blockNumber;
+      // Verify block signature
+      return this.verifyBlockSignature(block);
+
     } catch (error) {
-      if (attempt < this.maxRetries) {
-        await new Promise(resolve => setTimeout(resolve, this.retryDelay));
-        await this.processBlockWithRetry(blockNumber, attempt + 1);
-      } else {
-        this.handleError(`Failed to process block ${blockNumber}`, error);
-        throw error;
-      }
+      this.logger.error('Block validation failed', error);
+      return false;
     }
   }
 
-  private async subscribeToNewEvents(): Promise<void> {
-    this.provider.on('block', async (blockNumber: number) => {
-      if (!this.isRunning) return;
-      
-      try {
-        await this.processBlockWithRetry(blockNumber);
-      } catch (error) {
-        this.handleError(`Failed to process new block ${blockNumber}`, error);
-      }
-    });
-  }
-
-  private decodeEventName(log: ethers.providers.Log): string {
+  private async validateTransaction(tx: Transaction): Promise<boolean> {
     try {
-      return keccak256(log.topics[0]).slice(0, 10);
-    } catch {
-      return 'unknown';
-    }
-  }
-
-  private decodeEventData(log: ethers.providers.Log): any {
-    try {
-      return ethers.utils.defaultAbiCoder.decode(
-        ['bytes'],
-        ethers.utils.hexDataSlice(log.data, 0)
+      // Verify transaction signature
+      const signatureValid = crypto.verify(
+        Buffer.from(tx.hash),
+        Buffer.from(tx.signature, 'hex'),
+        Buffer.from(tx.publicKey, 'hex')
       );
-    } catch {
-      return log.data;
+
+      if (!signatureValid) {
+        return false;
+      }
+
+      // Additional transaction validation logic here
+      return true;
+
+    } catch (error) {
+      this.logger.error('Transaction validation failed', error);
+      return false;
     }
   }
 
-  private handleError(message: string, error: any): void {
-    this.logger?.error(message, {
-      error: error.message,
-      stack: error.stack
-    });
-    this.emit('error', { message, error });
+  private calculateBlockHash(block: Block): string {
+    const blockData = {
+      previousHash: block.previousHash,
+      timestamp: block.timestamp,
+      transactions: block.transactions,
+      nonce: block.nonce
+    };
+    return SHA256(JSON.stringify(blockData)).toString();
+  }
+
+  private verifyBlockSignature(block: Block): boolean {
+    try {
+      const keyPair = ECPair.fromPublicKey(Buffer.from(block.proposer, 'hex'));
+      return keyPair.verify(
+        Buffer.from(block.hash),
+        Buffer.from(block.signature, 'hex')
+      );
+    } catch (error) {
+      this.logger.error('Block signature verification failed', error);
+      return false;
+    }
+  }
+
+  public async finalizeBlock(hash: string): Promise<void> {
+    const block = this.pendingBlocks.get(hash);
+    if (!block) {
+      throw new Error('Block not found');
+    }
+
+    this.currentBlock = block;
+    this.chainHead = block.hash;
+    this.pendingBlocks.delete(hash);
+    this.emit('blockFinalized', block);
+  }
+
+  public getCurrentBlock(): Block | null {
+    return this.currentBlock;
+  }
+
+  public getChainHead(): string {
+    return this.chainHead;
   }
 }
 ```
